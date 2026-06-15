@@ -500,6 +500,21 @@ function getAutoRecallRerankInputLimit(retrieveLimit: number): number {
   return clampInt(retrieveLimit, 1, 20) * 2;
 }
 
+function getAutoRecallRerankTimeoutMs(
+  config: PluginConfig,
+  retrievalConfig: RetrievalConfig,
+  autoRecallTimeoutMs: number,
+): number | undefined {
+  if (retrievalConfig.rerank !== "cross-encoder" || !retrievalConfig.rerankApiKey) return undefined;
+  if (typeof config.retrieval?.rerankTimeoutMs === "number") return undefined;
+  if (!Number.isFinite(autoRecallTimeoutMs) || autoRecallTimeoutMs <= 0) return undefined;
+
+  const halfBudget = Math.floor(autoRecallTimeoutMs / 2);
+  if (halfBudget < 100) return 0;
+  if (autoRecallTimeoutMs <= 1_000) return halfBudget;
+  return clampInt(halfBudget, 500, 2_500);
+}
+
 export function buildAutoRecallRerankCostWarning(
   config: PluginConfig,
   retrievalConfig: RetrievalConfig = { ...DEFAULT_RETRIEVAL_CONFIG, ...(config.retrieval || {}) } as RetrievalConfig,
@@ -2573,6 +2588,8 @@ const memoryLanceDBProPlugin = {
       category?: string;
       source?: "manual" | "auto-recall" | "cli";
       signal?: AbortSignal;
+      rerankTimeoutMs?: number;
+      rerankDeadlineMs?: number;
     }) {
       let results = await retriever.retrieve(params);
       if (results.length === 0) {
@@ -3031,6 +3048,7 @@ const memoryLanceDBProPlugin = {
 
       const AUTO_RECALL_TIMEOUT_MS = parsePositiveInt(config.autoRecallTimeoutMs) ?? 5_000; // configurable; default raised from 3s to 5s for remote embedding APIs behind proxies
       api.on("before_prompt_build", async (event: any, ctx: any) => {
+        const autoRecallDeadlineMs = Date.now() + AUTO_RECALL_TIMEOUT_MS;
         // Skip auto-recall for sub-agent sessions — their context comes from the parent.
         const sessionKey = typeof ctx.sessionKey === "string" ? ctx.sessionKey : "";
         if (sessionKey.includes(":subagent:")) return;
@@ -3132,6 +3150,11 @@ const memoryLanceDBProPlugin = {
           const retrieveLimit = getAutoRecallRetrieveLimit(autoRecallMaxItems);
           const retrievalConfig = retriever.getConfig();
           const rerankInputLimit = getAutoRecallRerankInputLimit(retrieveLimit);
+          const autoRecallRerankTimeoutMs = getAutoRecallRerankTimeoutMs(
+            config,
+            retrievalConfig,
+            AUTO_RECALL_TIMEOUT_MS,
+          );
 
           // Adaptive intent analysis (zero-LLM-cost pattern matching)
           const intent = recallMode === "adaptive" ? analyzeIntent(recallQuery) : undefined;
@@ -3147,6 +3170,12 @@ const memoryLanceDBProPlugin = {
             scopeFilter: accessibleScopes,
             source: "auto-recall",
             signal: autoRecallAbortController.signal,
+            ...(autoRecallRerankTimeoutMs !== undefined
+              ? {
+                rerankTimeoutMs: autoRecallRerankTimeoutMs,
+                rerankDeadlineMs: autoRecallDeadlineMs,
+              }
+              : {}),
           }), config.workspaceBoundary);
 
           if (shouldDropLateAutoRecall("post-retrieve")) return;
